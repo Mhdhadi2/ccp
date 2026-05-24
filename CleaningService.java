@@ -1,5 +1,6 @@
 /**
  * CleaningService simulates cleaning and restocking.
+ * No shared state, only simulates activity via Thread.sleep().
  */
 public class CleaningService extends Thread {
     private final String planeName;
@@ -13,7 +14,7 @@ public class CleaningService extends Thread {
     public void run() {
         try {
             Logger.log(getName(), "Cleaning and restocking supplies.");
-            Thread.sleep(Utils.randomBetween(1000, 2000));
+            Thread.sleep(Utils.randomBetween(600, 1000));
             Logger.log(getName(), "Cleaning complete.");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
