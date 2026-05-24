@@ -4,6 +4,7 @@ import java.util.Queue;
 /**
  * Airport manages runway, gates, and ground capacity.
  * Uses synchronized, wait(), and notifyAll() for coordination.
+ * Emergency priority is enforced. ALL mutual exclusion uses synchronized.
  */
 public class Airport {
     private final Gate[] gates = {
@@ -15,10 +16,12 @@ public class Airport {
     private final RefuelTruck refuelTruck;
     private final Statistics stats;
 
+    // Only one plane may use the runway at a time! (Runway mutual exclusion)
     private boolean runwayFree = true;
-    private int planesOnGround = 0; // includes runway and gates
+    // Planes counted on ground (runway + gates); enforced max is 3
+    private int planesOnGround = 0;
 
-    // Waiting queues (air holding pattern)
+    // Queues for fairness & emergency priority in air
     private final Queue<Plane> emergencyQueue = new LinkedList<>();
     private final Queue<Plane> normalQueue = new LinkedList<>();
 
@@ -33,55 +36,81 @@ public class Airport {
 
     /**
      * Request permission to land.
-     * Blocks until runway is free, capacity allows, and plane has priority.
+     * Plane will be blocked until all are true:
+     * - Runway is free (no plane landing/taking off)
+     * - Airport ground capacity < 3
+     * - A gate is AVAILABLE and reserved IMMEDIATELY for this plane
+     * - Emergency plane has priority if one is present
+     * Returns the gate assigned (reserved) for this plane.
+     * Plane will NOT land and then wait for a gate: gate is assigned up front.
      */
-    public synchronized void requestLanding(Plane plane) {
+    public synchronized Gate requestLanding(Plane plane) {
         long requestTime = System.currentTimeMillis();
         plane.setLandingRequestTime(requestTime);
-        Logger.log("ATC", "Received landing request from " + plane.getName() + (plane.isEmergency() ? " (EMERGENCY)" : ""));
+        Logger.log("ATC", "Received landing request from " + plane.getName()
+                + (plane.isEmergency() ? " (EMERGENCY)" : ""));
 
-        // Enqueue plane
+        // Place plane in correct queue based on emergency
         if (plane.isEmergency()) {
             emergencyQueue.add(plane);
         } else {
             normalQueue.add(plane);
         }
 
+        Gate assignedGate = null;
+        // Wait until all conditions met for this plane (while = safe against spurious wakeups)
         while (true) {
             boolean capacityOk = planesOnGround < 3;
             boolean runwayOk = runwayFree;
             boolean hasPriority = isNextToLand(plane);
+            assignedGate = findAvailableGate();
 
-            if (capacityOk && runwayOk && hasPriority) {
-                // Grant permission
-                runwayFree = false;
-                planesOnGround++;
+            // Must have an assigned, reservable gate up front!
+            if (capacityOk && runwayOk && hasPriority && assignedGate != null) {
+                // Reserve gate immediately
+                assignedGate.occupy(plane.getName());
 
-                // Remove from queue
+                // Remove this plane from the appropriate queue
                 if (plane.isEmergency()) {
                     emergencyQueue.remove(plane);
                 } else {
                     normalQueue.remove(plane);
                 }
+                runwayFree = false; // Lock runway
+                planesOnGround++;
 
                 long grantTime = System.currentTimeMillis();
                 long waitTime = grantTime - requestTime;
                 stats.recordWaitingTime(waitTime);
 
-                Logger.log("ATC", "Landing permission granted for " + plane.getName() + " (waited " + waitTime + " ms)");
-                notifyAll();
-                return;
+                Logger.log("ATC", (plane.isEmergency() ? "[EMERGENCY PRIORITY] " : "")
+                    + "Landing permission granted for " + plane.getName()
+                    + " (waited " + waitTime + " ms). Gate reserved: " + assignedGate.getName());
+                notifyAll(); // Notify all planes of state change
+                return assignedGate;
             }
 
             try {
-                wait();
+                wait(); // Release airport lock; re-acquire later
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return;
+                return null;
             }
         }
     }
 
+    // Find the next free (unoccupied) gate, or null if all gates full
+    private Gate findAvailableGate() {
+        for (Gate g : gates) {
+            if (!g.isOccupied()) return g;
+        }
+        return null;
+    }
+
+    /**
+     * Determines if plane is next in landing queue.
+     * Emergency planes always have strict priority.
+     */
     private boolean isNextToLand(Plane plane) {
         if (!emergencyQueue.isEmpty()) {
             return emergencyQueue.peek() == plane;
@@ -99,29 +128,8 @@ public class Airport {
     }
 
     /**
-     * Assign a free gate to a plane. Blocks until a gate is free.
-     */
-    public synchronized Gate assignGate(Plane plane) {
-        while (true) {
-            for (Gate g : gates) {
-                if (!g.isOccupied()) {
-                    g.occupy(plane.getName());
-                    Logger.log("ATC", g.getName() + " assigned to " + plane.getName());
-                    notifyAll();
-                    return g;
-                }
-            }
-            try {
-                wait();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return null;
-            }
-        }
-    }
-
-    /**
      * Release a gate after plane departs.
+     * (Gate reservation cleared. notifyAll() wakes up any plane waiting for a gate.)
      */
     public synchronized void releaseGate(Gate gate, String planeName) {
         gate.release();
@@ -131,11 +139,12 @@ public class Airport {
 
     /**
      * Request permission to take off.
-     * Blocks until runway is free.
+     * Only permitted if runway is free.
+     * Note: plane is already undocked from gate and ready on taxiway.
      */
     public synchronized void requestTakeoff(Plane plane) {
         Logger.log("ATC", "Received takeoff request from " + plane.getName());
-        while (!runwayFree) {
+        while (!runwayFree) { // Proper waiting on runway
             try {
                 wait();
             } catch (InterruptedException e) {
@@ -150,6 +159,7 @@ public class Airport {
 
     /**
      * Called when plane fully departs airport (after takeoff).
+     * Updates planesOnGround and broadcasts change.
      */
     public synchronized void planeDeparted(String planeName) {
         planesOnGround--;
@@ -157,6 +167,7 @@ public class Airport {
         notifyAll();
     }
 
+    // Sanity check for statistics
     public synchronized boolean allGatesEmpty() {
         for (Gate g : gates) {
             if (g.isOccupied()) return false;
