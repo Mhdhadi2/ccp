@@ -1,5 +1,6 @@
 /**
  * RefuelService requests the shared RefuelTruck.
+ * RefuelTruck uses 'synchronized' so only a single plane can refuel at any time.
  */
 public class RefuelService extends Thread {
     private final String planeName;
